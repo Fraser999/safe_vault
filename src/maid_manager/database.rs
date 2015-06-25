@@ -176,11 +176,11 @@ impl MaidManagerDatabase {
         let mut actions = Vec::with_capacity(self.storage.len());
         for (key, value) in self.storage.iter() {
             let maid_manager_wrapper = MaidManagerAccountWrapper::new((*key).clone(), (*value).clone());
-            let payload = Payload::new(PayloadTypeTag::MaidManagerAccountTransfer, &maid_manager_wrapper);
             let mut e = cbor::Encoder::from_memory();
-            e.encode(&[payload]).unwrap();
+            e.encode(&[maid_manager_wrapper]).unwrap();
             actions.push(MethodCall::Refresh {
-                type_tag: maid_manager_wrapper.type_tag(), from_group: maid_manager_wrapper.name(),
+                type_tag: maid_manager_wrapper.type_tag(),
+                from_group: maid_manager_wrapper.name(),
                 payload: e.as_bytes().to_vec()
             });
         }
