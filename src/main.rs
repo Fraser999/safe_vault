@@ -39,7 +39,8 @@
 
 #[macro_use]
 extern crate log;
-extern crate env_logger;
+#[macro_use]
+extern crate maidsafe_utilities;
 
 // Non-MaidSafe crates
 extern crate cbor;
@@ -52,8 +53,10 @@ extern crate rand;
 
 // MaidSafe crates
 extern crate crust;
+extern crate kademlia_routing_table;
 extern crate lru_time_cache;
 extern crate routing;
+extern crate xor_name;
 
 #[macro_use]
 mod macros;
@@ -73,7 +76,7 @@ mod vault;
 
 /// Runs a SAFE Network vault.
 pub fn main() {
-    ::utils::initialise_logger();
-    ::utils::handle_version();
-    ::vault::Vault::run();
+    maidsafe_utilities::log::init(false);
+    utils::handle_version();
+    vault::Vault::run();
 }
