@@ -53,13 +53,14 @@
 #[macro_use]
 mod common;
 
-use self::common::{Environment, TestClient, TestVault};
+use self::common::{Environment, TestApp, TestClient, TestClientTrait, TestVault};
 use rand::Rng;
 use safe_nd::{
-    Coins, Error as NdError, IData, IDataAddress, LoginPacket, PubImmutableData, Request, Response,
-    UnpubImmutableData, XorName,
+    AppPermissions, Coins, Error as NdError, IData, IDataAddress, LoginPacket, PubImmutableData,
+    Request, Response, UnpubImmutableData, XorName,
 };
 use safe_vault::COST_OF_PUT;
+use std::collections::BTreeMap;
 use unwrap::unwrap;
 
 #[test]
@@ -99,7 +100,7 @@ fn login_packets() {
         login_packet_locator,
         *client.public_id().public_key(),
         login_packet_data.clone(),
-        client.full_id().sign(&login_packet_data),
+        client.sign(&login_packet_data),
     ));
 
     common::perform_mutation(
@@ -173,7 +174,7 @@ fn update_login_packet() {
         login_packet_locator,
         *client.public_id().public_key(),
         login_packet_data.clone(),
-        client.full_id().sign(&login_packet_data),
+        client.sign(&login_packet_data),
     ));
 
     common::perform_mutation(
@@ -186,7 +187,7 @@ fn update_login_packet() {
     // Update the login packet data.
     let new_login_packet_data = vec![1; 32];
     let client_public_key = *client.public_id().public_key();
-    let signature = client.full_id().sign(&new_login_packet_data);
+    let signature = client.sign(&new_login_packet_data);
     common::perform_mutation(
         &mut env,
         &mut client,
@@ -805,4 +806,166 @@ fn delete_immutable_data() {
         Request::DeleteUnpubIData(IDataAddress::Unpub(unpub_idata_address)),
         Response::Mutation(Err(NdError::NoSuchData)),
     )
+}
+
+#[test]
+fn auth_keys() {
+    let mut env = Environment::new();
+    let mut vault = TestVault::new();
+    let conn_info = vault.connection_info();
+
+    let mut owner = TestClient::new(env.rng());
+    let mut app = TestApp::new(env.rng(), owner.public_id().clone());
+    common::establish_connection(&mut env, &mut owner, &mut vault);
+    common::establish_connection(&mut env, &mut app, &mut vault);
+
+    // Try to insert and then list authorised keys using a client with no balance.  Each should
+    // return `NoSuchBalance`.
+    let permissions = AppPermissions {
+        transfer_coins: true,
+    };
+    let app_public_key = *app.public_id().public_key();
+    let insert_app = |version, client: &mut TestClient, vlt: &mut TestVault| {
+        let message_id = client.send_request(
+            conn_info.clone(),
+            Request::InsAuthKey {
+                key: app_public_key,
+                version,
+                permissions,
+            },
+        );
+        env.poll(vlt);
+        message_id
+    };
+    let mut message_id = insert_app(1, &mut owner, &mut vault);
+    match owner.expect_response(message_id) {
+        Response::Mutation(Err(NdError::NoSuchBalance)) => (),
+        x => unexpected!(x),
+    }
+
+    message_id = owner.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    env.poll(&mut vault);
+    match owner.expect_response(message_id) {
+        Response::ListAuthKeysAndVersion(Err(NdError::NoSuchBalance)) => (),
+        x => unexpected!(x),
+    }
+
+    // Create a balance for the owner and check that listing authorised keys returns an empty
+    // collection.
+    message_id = owner.send_request(
+        conn_info.clone(),
+        Request::CreateBalance {
+            new_balance_owner: *owner.public_id().public_key(),
+            amount: unwrap!(Coins::from_nano(1_000_000_000_000)),
+            transaction_id: 0,
+        },
+    );
+    env.poll(&mut vault);
+    match owner.expect_response(message_id) {
+        Response::Transaction(Ok(_)) => (),
+        x => unexpected!(x),
+    }
+
+    message_id = owner.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    env.poll(&mut vault);
+    let mut expected_map = BTreeMap::new();
+    match owner.expect_response(message_id) {
+        Response::ListAuthKeysAndVersion(Ok(result)) => {
+            assert_eq!((expected_map.clone(), 0), result);
+        }
+        x => unexpected!(x),
+    }
+
+    // Insert then list the app.
+    message_id = insert_app(1, &mut owner, &mut vault);
+    match owner.expect_response(message_id) {
+        Response::Mutation(Ok(())) => (),
+        x => unexpected!(x),
+    }
+
+    message_id = owner.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    env.poll(&mut vault);
+    let _ = expected_map.insert(*app.public_id().public_key(), permissions);
+    match owner.expect_response(message_id) {
+        Response::ListAuthKeysAndVersion(Ok(result)) => {
+            assert_eq!((expected_map.clone(), 1), result);
+        }
+        x => unexpected!(x),
+    }
+
+    // Check the app isn't allowed to get a listing of authorised keys, nor insert, nor delete any.
+    // No response should be returned to any of these requests.
+    let _ = app.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    let _ = app.send_request(
+        conn_info.clone(),
+        Request::InsAuthKey {
+            key: *app.public_id().public_key(),
+            version: 2,
+            permissions,
+        },
+    );
+    let _ = app.send_request(
+        conn_info.clone(),
+        Request::DelAuthKey {
+            key: *app.public_id().public_key(),
+            version: 2,
+        },
+    );
+    env.poll(&mut vault);
+    app.expect_no_new_message();
+
+    // Remove the app, then list the keys.
+    message_id = owner.send_request(
+        conn_info.clone(),
+        Request::DelAuthKey {
+            key: *app.public_id().public_key(),
+            version: 2,
+        },
+    );
+    env.poll(&mut vault);
+    match owner.expect_response(message_id) {
+        Response::Mutation(Ok(())) => (),
+        x => unexpected!(x),
+    }
+
+    message_id = owner.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    env.poll(&mut vault);
+    match owner.expect_response(message_id) {
+        Response::ListAuthKeysAndVersion(Ok(result)) => {
+            assert_eq!((BTreeMap::new(), 2), result);
+        }
+        x => unexpected!(x),
+    }
+
+    // Try to insert using an invalid version number.
+    message_id = insert_app(100, &mut owner, &mut vault);
+    match owner.expect_response(message_id) {
+        Response::Mutation(Err(NdError::InvalidSuccessor(2))) => (),
+        x => unexpected!(x),
+    }
+
+    message_id = owner.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    env.poll(&mut vault);
+    match owner.expect_response(message_id) {
+        Response::ListAuthKeysAndVersion(Ok(result)) => {
+            assert_eq!((BTreeMap::new(), 2), result);
+        }
+        x => unexpected!(x),
+    }
+
+    // Insert again and list again.
+    message_id = insert_app(3, &mut owner, &mut vault);
+    match owner.expect_response(message_id) {
+        Response::Mutation(Ok(())) => (),
+        x => unexpected!(x),
+    }
+
+    message_id = owner.send_request(conn_info.clone(), Request::ListAuthKeysAndVersion);
+    env.poll(&mut vault);
+    match owner.expect_response(message_id) {
+        Response::ListAuthKeysAndVersion(Ok(result)) => {
+            assert_eq!((expected_map, 3), result);
+        }
+        x => unexpected!(x),
+    }
 }

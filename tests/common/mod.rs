@@ -15,8 +15,8 @@ pub use self::rng::TestRng;
 use bytes::Bytes;
 use crossbeam_channel::Receiver;
 use safe_nd::{
-    Challenge, ClientFullId, ClientPublicId, Coins, IData, IDataAddress, Message, MessageId,
-    PublicId, Request, Response,
+    AppFullId, AppPublicId, Challenge, ClientFullId, ClientPublicId, Coins, IData, IDataAddress,
+    Message, MessageId, PublicId, Request, Response, Signature,
 };
 use safe_vault::{
     mock::Network,
@@ -132,37 +132,38 @@ impl AsMutSlice<TestVault> for [TestVault] {
     }
 }
 
-pub struct TestClient {
-    quic_p2p: QuicP2p,
-    rx: Receiver<Event>,
-    full_id: ClientFullId,
+pub enum FullId {
+    Client(ClientFullId),
+    App(AppFullId),
 }
 
-impl TestClient {
-    pub fn new(rng: &mut TestRng) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let config = quic_p2p::Config {
-            our_type: OurType::Client,
-            ..Default::default()
-        };
-
-        Self {
-            quic_p2p: unwrap!(Builder::new(tx).with_config(config).build()),
-            rx,
-            full_id: ClientFullId::new_ed25519(rng),
+impl FullId {
+    fn sign<T: AsRef<[u8]>>(&self, data: T) -> Signature {
+        match self {
+            FullId::Client(full_id) => full_id.sign(data),
+            FullId::App(full_id) => full_id.sign(data),
         }
     }
 
-    pub fn public_id(&self) -> &ClientPublicId {
-        self.full_id.public_id()
+    fn public_id(&self) -> PublicId {
+        match self {
+            FullId::Client(full_id) => PublicId::Client(full_id.public_id().clone()),
+            FullId::App(full_id) => PublicId::App(full_id.public_id().clone()),
+        }
+    }
+}
+
+pub trait TestClientTrait {
+    fn quic_p2p(&mut self) -> &mut QuicP2p;
+    fn rx(&self) -> &Receiver<Event>;
+    fn full_id(&self) -> &FullId;
+
+    fn sign<T: AsRef<[u8]>>(&self, data: T) -> Signature {
+        self.full_id().sign(data)
     }
 
-    pub fn full_id(&self) -> &ClientFullId {
-        &self.full_id
-    }
-
-    pub fn expect_connected_to(&self, conn_info: &NodeInfo) {
-        match self.rx.try_recv() {
+    fn expect_connected_to(&self, conn_info: &NodeInfo) {
+        match self.rx().try_recv() {
             Ok(Event::ConnectedTo {
                 peer: Peer::Node { ref node_info },
             }) if node_info == conn_info => (),
@@ -170,14 +171,21 @@ impl TestClient {
         }
     }
 
-    pub fn expect_new_message(&self) -> (SocketAddr, Bytes) {
-        match self.rx.try_recv() {
+    fn expect_new_message(&self) -> (SocketAddr, Bytes) {
+        match self.rx().try_recv() {
             Ok(Event::NewMessage { peer_addr, msg }) => (peer_addr, msg),
             x => unexpected!(x),
         }
     }
 
-    pub fn handle_challenge_from(&mut self, conn_info: &NodeInfo) {
+    fn expect_no_new_message(&self) {
+        match self.rx().try_recv() {
+            Err(error) => assert!(error.is_empty()),
+            x => unexpected!(x),
+        }
+    }
+
+    fn handle_challenge_from(&mut self, conn_info: &NodeInfo) {
         let (sender, bytes) = self.expect_new_message();
         assert_eq!(sender, conn_info.peer_addr);
 
@@ -187,18 +195,15 @@ impl TestClient {
             Challenge::Response(..) => panic!("Unexpected Challenge::Response"),
         };
 
-        let signature = self.full_id.sign(payload);
-        let response = Challenge::Response(
-            PublicId::Client(self.full_id.public_id().clone()),
-            signature,
-        );
+        let signature = self.full_id().sign(payload);
+        let response = Challenge::Response(self.full_id().public_id().clone(), signature);
 
         self.send(conn_info.clone(), &response);
     }
 
-    pub fn send<T: Serialize>(&mut self, recipient: NodeInfo, msg: &T) {
+    fn send<T: Serialize>(&mut self, recipient: NodeInfo, msg: &T) {
         let msg = unwrap!(bincode::serialize(msg));
-        self.quic_p2p.send(
+        self.quic_p2p().send(
             Peer::Node {
                 node_info: recipient,
             },
@@ -206,12 +211,12 @@ impl TestClient {
         )
     }
 
-    pub fn send_request(&mut self, recipient: NodeInfo, request: Request) -> MessageId {
+    fn send_request(&mut self, recipient: NodeInfo, request: Request) -> MessageId {
         let message_id = MessageId::new();
 
         let to_sign = (&request, &message_id);
         let to_sign = unwrap!(bincode::serialize(&to_sign));
-        let signature = self.full_id.sign(&to_sign);
+        let signature = self.full_id().sign(&to_sign);
 
         let msg = Message::Request {
             request,
@@ -224,7 +229,7 @@ impl TestClient {
         message_id
     }
 
-    pub fn expect_response(&mut self, expected_message_id: MessageId) -> Response {
+    fn expect_response(&mut self, expected_message_id: MessageId) -> Response {
         let bytes = self.expect_new_message().1;
         let message: Message = unwrap!(bincode::deserialize(&bytes));
 
@@ -244,6 +249,50 @@ impl TestClient {
     }
 }
 
+pub struct TestClient {
+    quic_p2p: QuicP2p,
+    rx: Receiver<Event>,
+    full_id: FullId,
+    public_id: ClientPublicId,
+}
+
+impl TestClient {
+    pub fn new(rng: &mut TestRng) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let config = quic_p2p::Config {
+            our_type: OurType::Client,
+            ..Default::default()
+        };
+        let client_full_id = ClientFullId::new_ed25519(rng);
+        let public_id = client_full_id.public_id().clone();
+
+        Self {
+            quic_p2p: unwrap!(Builder::new(tx).with_config(config).build()),
+            rx,
+            full_id: FullId::Client(client_full_id),
+            public_id,
+        }
+    }
+
+    pub fn public_id(&self) -> &ClientPublicId {
+        &self.public_id
+    }
+}
+
+impl TestClientTrait for TestClient {
+    fn quic_p2p(&mut self) -> &mut QuicP2p {
+        &mut self.quic_p2p
+    }
+
+    fn rx(&self) -> &Receiver<Event> {
+        &self.rx
+    }
+
+    fn full_id(&self) -> &FullId {
+        &self.full_id
+    }
+}
+
 impl Deref for TestClient {
     type Target = QuicP2p;
 
@@ -258,9 +307,71 @@ impl DerefMut for TestClient {
     }
 }
 
-pub fn establish_connection(env: &mut Environment, client: &mut TestClient, vault: &mut TestVault) {
+pub struct TestApp {
+    quic_p2p: QuicP2p,
+    rx: Receiver<Event>,
+    full_id: FullId,
+    public_id: AppPublicId,
+}
+
+impl TestApp {
+    pub fn new(rng: &mut TestRng, owner: ClientPublicId) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let config = quic_p2p::Config {
+            our_type: OurType::Client,
+            ..Default::default()
+        };
+        let app_full_id = AppFullId::new_ed25519(rng, owner);
+        let public_id = app_full_id.public_id().clone();
+
+        Self {
+            quic_p2p: unwrap!(Builder::new(tx).with_config(config).build()),
+            rx,
+            full_id: FullId::App(app_full_id),
+            public_id,
+        }
+    }
+
+    pub fn public_id(&self) -> &AppPublicId {
+        &self.public_id
+    }
+}
+
+impl TestClientTrait for TestApp {
+    fn quic_p2p(&mut self) -> &mut QuicP2p {
+        &mut self.quic_p2p
+    }
+
+    fn rx(&self) -> &Receiver<Event> {
+        &self.rx
+    }
+
+    fn full_id(&self) -> &FullId {
+        &self.full_id
+    }
+}
+
+impl Deref for TestApp {
+    type Target = QuicP2p;
+
+    fn deref(&self) -> &Self::Target {
+        &self.quic_p2p
+    }
+}
+
+impl DerefMut for TestApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.quic_p2p
+    }
+}
+
+pub fn establish_connection<T: TestClientTrait>(
+    env: &mut Environment,
+    client: &mut T,
+    vault: &mut TestVault,
+) {
     let conn_info = vault.connection_info();
-    client.connect_to(conn_info.clone());
+    client.quic_p2p().connect_to(conn_info.clone());
     env.poll(vault);
 
     client.expect_connected_to(&conn_info);
@@ -268,9 +379,9 @@ pub fn establish_connection(env: &mut Environment, client: &mut TestClient, vaul
     env.poll(vault);
 }
 
-pub fn perform_transaction(
+pub fn perform_transaction<T: TestClientTrait>(
     env: &mut Environment,
-    client: &mut TestClient,
+    client: &mut T,
     vault: &mut TestVault,
     request: Request,
 ) {
@@ -284,9 +395,9 @@ pub fn perform_transaction(
     }
 }
 
-pub fn perform_mutation(
+pub fn perform_mutation<T: TestClientTrait>(
     env: &mut Environment,
-    client: &mut TestClient,
+    client: &mut T,
     vault: &mut TestVault,
     request: Request,
 ) {
@@ -300,9 +411,9 @@ pub fn perform_mutation(
     }
 }
 
-pub fn get_idata(
+pub fn get_idata<T: TestClientTrait>(
     env: &mut Environment,
-    client: &mut TestClient,
+    client: &mut T,
     vault: &mut TestVault,
     address: IDataAddress,
 ) -> Vec<u8> {
@@ -317,7 +428,11 @@ pub fn get_idata(
     }
 }
 
-pub fn get_balance(env: &mut Environment, client: &mut TestClient, vault: &mut TestVault) -> Coins {
+pub fn get_balance<T: TestClientTrait>(
+    env: &mut Environment,
+    client: &mut T,
+    vault: &mut TestVault,
+) -> Coins {
     let conn_info = vault.connection_info();
     let message_id = client.send_request(conn_info, Request::GetBalance);
 
