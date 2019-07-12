@@ -25,8 +25,10 @@ use safe_vault::{
 };
 use serde::Serialize;
 use std::{
+    cell::RefCell,
     net::SocketAddr,
     ops::{Deref, DerefMut},
+    rc::Rc,
     slice,
 };
 use tempdir::TempDir;
@@ -157,6 +159,8 @@ pub trait TestClientTrait {
     fn quic_p2p(&mut self) -> &mut QuicP2p;
     fn rx(&self) -> &Receiver<Event>;
     fn full_id(&self) -> &FullId;
+    fn env(&self) -> &Rc<RefCell<Environment>>;
+    fn vault(&self) -> &Rc<RefCell<TestVault>>;
 
     fn sign<T: AsRef<[u8]>>(&self, data: T) -> Signature {
         self.full_id().sign(data)
@@ -254,16 +258,18 @@ pub struct TestClient {
     rx: Receiver<Event>,
     full_id: FullId,
     public_id: ClientPublicId,
+    env: Rc<RefCell<Environment>>,
+    vault: Rc<RefCell<TestVault>>,
 }
 
 impl TestClient {
-    pub fn new(rng: &mut TestRng) -> Self {
+    pub fn new(env: Rc<RefCell<Environment>>, vault: Rc<RefCell<TestVault>>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let config = quic_p2p::Config {
             our_type: OurType::Client,
             ..Default::default()
         };
-        let client_full_id = ClientFullId::new_ed25519(rng);
+        let client_full_id = ClientFullId::new_ed25519(env.borrow_mut().rng());
         let public_id = client_full_id.public_id().clone();
 
         Self {
@@ -271,6 +277,8 @@ impl TestClient {
             rx,
             full_id: FullId::Client(client_full_id),
             public_id,
+            env,
+            vault,
         }
     }
 
@@ -290,6 +298,14 @@ impl TestClientTrait for TestClient {
 
     fn full_id(&self) -> &FullId {
         &self.full_id
+    }
+
+    fn env(&self) -> &Rc<RefCell<Environment>> {
+        &self.env
+    }
+
+    fn vault(&self) -> &Rc<RefCell<TestVault>> {
+        &self.vault
     }
 }
 
@@ -312,16 +328,22 @@ pub struct TestApp {
     rx: Receiver<Event>,
     full_id: FullId,
     public_id: AppPublicId,
+    env: Rc<RefCell<Environment>>,
+    vault: Rc<RefCell<TestVault>>,
 }
 
 impl TestApp {
-    pub fn new(rng: &mut TestRng, owner: ClientPublicId) -> Self {
+    pub fn new(
+        owner: ClientPublicId,
+        env: Rc<RefCell<Environment>>,
+        vault: Rc<RefCell<TestVault>>,
+    ) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let config = quic_p2p::Config {
             our_type: OurType::Client,
             ..Default::default()
         };
-        let app_full_id = AppFullId::new_ed25519(rng, owner);
+        let app_full_id = AppFullId::new_ed25519(env.borrow_mut().rng(), owner);
         let public_id = app_full_id.public_id().clone();
 
         Self {
@@ -329,6 +351,8 @@ impl TestApp {
             rx,
             full_id: FullId::App(app_full_id),
             public_id,
+            env,
+            vault,
         }
     }
 
@@ -349,6 +373,14 @@ impl TestClientTrait for TestApp {
     fn full_id(&self) -> &FullId {
         &self.full_id
     }
+
+    fn env(&self) -> &Rc<RefCell<Environment>> {
+        &self.env
+    }
+
+    fn vault(&self) -> &Rc<RefCell<TestVault>> {
+        &self.vault
+    }
 }
 
 impl Deref for TestApp {
@@ -365,29 +397,29 @@ impl DerefMut for TestApp {
     }
 }
 
-pub fn establish_connection<T: TestClientTrait>(
-    env: &mut Environment,
-    client: &mut T,
-    vault: &mut TestVault,
-) {
-    let conn_info = vault.connection_info();
+pub fn establish_connection<T: TestClientTrait>(client: &mut T) {
+    let conn_info = client.vault().borrow_mut().connection_info();
     client.quic_p2p().connect_to(conn_info.clone());
-    env.poll(vault);
+    client
+        .env()
+        .borrow()
+        .poll(&mut *client.vault().borrow_mut());
 
     client.expect_connected_to(&conn_info);
     client.handle_challenge_from(&conn_info);
-    env.poll(vault);
+    client
+        .env()
+        .borrow()
+        .poll(&mut *client.vault().borrow_mut());
 }
 
-pub fn perform_transaction<T: TestClientTrait>(
-    env: &mut Environment,
-    client: &mut T,
-    vault: &mut TestVault,
-    request: Request,
-) {
-    let conn_info = vault.connection_info();
+pub fn perform_transaction<T: TestClientTrait>(client: &mut T, request: Request) {
+    let conn_info = client.vault().borrow_mut().connection_info();
     let message_id = client.send_request(conn_info, request);
-    env.poll(vault);
+    client
+        .env()
+        .borrow()
+        .poll(&mut *client.vault().borrow_mut());
 
     match client.expect_response(message_id) {
         Response::Transaction(Ok(_)) => (),
@@ -395,15 +427,13 @@ pub fn perform_transaction<T: TestClientTrait>(
     }
 }
 
-pub fn perform_mutation<T: TestClientTrait>(
-    env: &mut Environment,
-    client: &mut T,
-    vault: &mut TestVault,
-    request: Request,
-) {
-    let conn_info = vault.connection_info();
+pub fn perform_mutation<T: TestClientTrait>(client: &mut T, request: Request) {
+    let conn_info = client.vault().borrow_mut().connection_info();
     let message_id = client.send_request(conn_info, request);
-    env.poll(vault);
+    client
+        .env()
+        .borrow()
+        .poll(&mut *client.vault().borrow_mut());
 
     match client.expect_response(message_id) {
         Response::Mutation(Ok(())) => (),
